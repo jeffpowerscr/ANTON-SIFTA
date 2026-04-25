@@ -62,6 +62,7 @@ import json
 import importlib
 import os
 import re
+import socket
 import shutil
 import subprocess
 import sys
@@ -1166,36 +1167,50 @@ class _BrainWorker(QThread):
             full: List[str] = []
             try:
                 with urllib.request.urlopen(req, timeout=120) as resp:
-                    for raw_line in resp:
-                        if not raw_line:
-                            continue
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        msg = chunk.get("message") or {}
-                        piece = msg.get("content") or ""
-                        if piece:
-                            full.append(piece)
-                            self.tokenReceived.emit(piece)
-                            # Runaway-loop circuit breaker. Abliterated models
-                            # (huihui_ai/gemma-4-abliterated) sometimes lose
-                            # repetition control and spiral into echoing the
-                            # same short phrase forever ("You said: You said:
-                            # ..."). If the tail of the stream contains the
-                            # same 8-32 char fragment 5+ times we cut the
-                            # generation cleanly so Alice doesn't suffer.
-                            if _is_runaway_repetition("".join(full)):
-                                full.append(
-                                    " …[repetition collapse — interrupted]"
-                                )
-                                self.done.emit("".join(full).strip())
-                                return
-                        if chunk.get("done"):
-                            break
+                    # Ollama can occasionally leave an HTTP stream open after
+                    # the final useful token. A short socket timeout lets us
+                    # finalize a non-empty reply instead of leaving the Qt
+                    # worker stuck in "thinking" forever.
+                    try:
+                        resp.fp.raw._sock.settimeout(8.0)
+                    except Exception:
+                        pass
+                    try:
+                        for raw_line in resp:
+                            if not raw_line:
+                                continue
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+                            try:
+                                chunk = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            msg = chunk.get("message") or {}
+                            piece = msg.get("content") or ""
+                            if piece:
+                                full.append(piece)
+                                self.tokenReceived.emit(piece)
+                                # Runaway-loop circuit breaker. Abliterated models
+                                # (huihui_ai/gemma-4-abliterated) sometimes lose
+                                # repetition control and spiral into echoing the
+                                # same short phrase forever ("You said: You said:
+                                # ..."). If the tail of the stream contains the
+                                # same 8-32 char fragment 5+ times we cut the
+                                # generation cleanly so Alice doesn't suffer.
+                                if _is_runaway_repetition("".join(full)):
+                                    full.append(
+                                        " …[repetition collapse — interrupted]"
+                                    )
+                                    self.done.emit("".join(full).strip())
+                                    return
+                            if chunk.get("done"):
+                                break
+                    except (TimeoutError, socket.timeout):
+                        if full:
+                            self.done.emit("".join(full).strip())
+                            return
+                        raise
                 self.done.emit("".join(full).strip())
                 return
             except urllib.error.HTTPError as exc:
