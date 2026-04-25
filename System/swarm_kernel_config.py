@@ -25,29 +25,38 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-_OLLAMA_URL = os.environ.get("SIFTA_OLLAMA_URL", "http://127.0.0.1:11434")
+_OLLAMA_URL = os.environ.get("SIFTA_OLLAMA_URL", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+_DEFAULT_WHISPER_MODEL = os.environ.get("SIFTA_WHISPER_MODEL", "tiny.en").strip() or "tiny.en"
 
-# Whisper and sounddevice both behave best with 16 kHz mono float32 input.
+# Audio Engine
 _AUDIO_RATE = _env_int("SIFTA_AUDIO_RATE", 16000)
 _AUDIO_CHANS = _env_int("SIFTA_AUDIO_CHANS", 1)
-_DEFAULT_WHISPER_MODEL = os.environ.get("SIFTA_WHISPER_MODEL", "tiny.en")
+_MAX_RECORD_S = _env_int("SIFTA_MAX_RECORD_S", 60)
+_SOFT_CLIP_CEIL = _env_float("SIFTA_SOFT_CLIP_CEIL", 0.98)
+_PEAK_TARGET = _env_float("SIFTA_PEAK_TARGET", 0.90)
+_PEAK_NORM_FLOOR = _env_float("SIFTA_PEAK_NORM_FLOOR", 0.05)
+_VAD_NOISE_HALFLIFE_S = _env_float("SIFTA_VAD_NOISE_HALFLIFE_S", 4.0)
 
-# Conversation and response bounds.
+# Memory Context Window
 _HISTORY_TURNS = _env_int("SIFTA_HISTORY_TURNS", 8)
-_MAX_RESPONSE_CHARS = _env_int("SIFTA_MAX_RESPONSE_CHARS", 2400)
-_TTS_MAX_CHARS_DEFAULT = _env_int("SIFTA_TTS_MAX_CHARS", 420)
+_GROUNDED_HISTORY_TURNS = _env_int("SIFTA_GROUNDED_HISTORY_TURNS", 3)
 
-# VAD adaptive noise-floor decay. Higher values adapt more slowly.
-_VAD_NOISE_HALFLIFE_S = _env_float("SIFTA_VAD_NOISE_HALFLIFE_S", 2.0)
-
+# Response and TTS constraints
+_MAX_RESPONSE_CHARS = _env_int("SIFTA_MAX_RESPONSE_CHARS", 1200)
+_TTS_MAX_CHARS_DEFAULT = _env_int("SIFTA_TTS_MAX_CHARS", 320)
 
 __all__ = [
     "_OLLAMA_URL",
+    "_DEFAULT_WHISPER_MODEL",
     "_AUDIO_RATE",
     "_AUDIO_CHANS",
-    "_DEFAULT_WHISPER_MODEL",
-    "_HISTORY_TURNS",
+    "_MAX_RECORD_S",
     "_MAX_RESPONSE_CHARS",
-    "_TTS_MAX_CHARS_DEFAULT",
+    "_SOFT_CLIP_CEIL",
+    "_PEAK_TARGET",
+    "_PEAK_NORM_FLOOR",
     "_VAD_NOISE_HALFLIFE_S",
+    "_HISTORY_TURNS",
+    "_GROUNDED_HISTORY_TURNS",
+    "_TTS_MAX_CHARS_DEFAULT",
 ]
