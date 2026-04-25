@@ -467,6 +467,11 @@ class SystemSettingsWidget(SiftaBaseWidget):
 
     def _inference_page(self) -> QWidget:
         page, root = self._page("Inference")
+
+        self.inference_default_card = MetricCard("Default Local Model", "--")
+        self.inference_alice_card = MetricCard("Alice Brain Model", "--")
+        root.addWidget(self.inference_default_card)
+        root.addWidget(self.inference_alice_card)
         
         form = QGridLayout()
         form.setHorizontalSpacing(12)

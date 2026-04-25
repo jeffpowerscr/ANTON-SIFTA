@@ -1999,6 +1999,19 @@ class TalkToAliceWidget(SiftaBaseWidget):
         self._status_pill.setStyleSheet(self._pill_style("idle"))
         bottom.addWidget(self._status_pill, 3)
 
+        self._mic_toggle_btn = QPushButton("Turn Mic Off")
+        self._mic_toggle_btn.setMinimumHeight(56)
+        self._mic_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mic_toggle_btn.setToolTip("Stop or restart Alice's microphone listener. Text chat stays available.")
+        self._mic_toggle_btn.setStyleSheet(
+            "QPushButton { background: rgb(58,45,76); color: rgb(230,225,245); "
+            "font-weight: 700; border: 1px solid rgb(95,78,125); border-radius: 8px; "
+            "padding: 0 16px; }"
+            "QPushButton:hover { background: rgb(74,57,98); }"
+        )
+        self._mic_toggle_btn.clicked.connect(self._toggle_mic)
+        bottom.addWidget(self._mic_toggle_btn, 1)
+
         self._level = QProgressBar()
         self._level.setRange(0, 100)
         self._level.setValue(0)
@@ -2022,6 +2035,7 @@ class TalkToAliceWidget(SiftaBaseWidget):
         self._tts: Optional[_TTSWorker] = None
         self._streaming_response: List[str] = []
         self._listener_state = "idle"           # for the pill
+        self._mic_enabled = True
 
         # Periodic level decay so the bar relaxes when you stop speaking.
         self.make_timer(80, self._decay_level)
@@ -2109,6 +2123,55 @@ class TalkToAliceWidget(SiftaBaseWidget):
     _MIC_RETRY_MAX_ATTEMPTS   = 15      # ~30 s aggressive retry window
     _MIC_SELF_HEAL_INTERVAL_MS = 60000  # then keep checking every minute
 
+    def _update_mic_toggle_button(self) -> None:
+        if getattr(self, "_mic_enabled", True):
+            self._mic_toggle_btn.setText("Turn Mic Off")
+            self._mic_toggle_btn.setToolTip("Stop Alice's microphone listener. Text chat stays available.")
+            self._mic_toggle_btn.setStyleSheet(
+                "QPushButton { background: rgb(58,45,76); color: rgb(230,225,245); "
+                "font-weight: 700; border: 1px solid rgb(95,78,125); border-radius: 8px; "
+                "padding: 0 16px; }"
+                "QPushButton:hover { background: rgb(74,57,98); }"
+            )
+        else:
+            self._mic_toggle_btn.setText("Turn Mic On")
+            self._mic_toggle_btn.setToolTip("Restart Alice's microphone listener.")
+            self._mic_toggle_btn.setStyleSheet(
+                "QPushButton { background: rgb(78,32,48); color: rgb(255,220,226); "
+                "font-weight: 700; border: 1px solid rgb(170,82,105); border-radius: 8px; "
+                "padding: 0 16px; }"
+                "QPushButton:hover { background: rgb(102,42,62); }"
+            )
+
+    def _toggle_mic(self) -> None:
+        self._set_mic_enabled(not getattr(self, "_mic_enabled", True))
+
+    def _set_mic_enabled(self, enabled: bool) -> None:
+        self._mic_enabled = bool(enabled)
+        self._update_mic_toggle_button()
+
+        if not self._mic_enabled:
+            try:
+                if self._listener is not None:
+                    self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+            self._mic_retry_attempts = 0
+            self._level_target = 0.0
+            self._level_current = 0.0
+            self._level.setValue(0)
+            if not self._busy:
+                self._set_pill("muted", "🔇 mic off — type to talk")
+            self.set_status("Microphone off. Text chat still works.")
+            return
+
+        self._mic_retry_attempts = 0
+        if not self._busy:
+            self._set_pill("idle", "🎙  starting mic…")
+        self.set_status("Starting microphone listener…")
+        QTimer.singleShot(0, self._start_listener)
+
     def _poll_imessage_inbox(self) -> None:
         """Ingest one schema-validated iMessage row, if present."""
         if self._busy:
@@ -2138,6 +2201,8 @@ class TalkToAliceWidget(SiftaBaseWidget):
             print(f"Error polling imessage inbox: {e}")
 
     def _start_listener(self) -> None:
+        if not getattr(self, "_mic_enabled", True):
+            return
         if self._listener is not None:
             return
         attempts = getattr(self, "_mic_retry_attempts", 0)
@@ -2176,6 +2241,8 @@ class TalkToAliceWidget(SiftaBaseWidget):
         QTimer.singleShot(delay, self._try_mic_recovery)
 
     def _try_mic_recovery(self) -> None:
+        if not getattr(self, "_mic_enabled", True):
+            return
         if self._listener is not None:
             return  # someone (or a recovery) already brought it back
         attempts = getattr(self, "_mic_retry_attempts", 0)
@@ -2189,6 +2256,8 @@ class TalkToAliceWidget(SiftaBaseWidget):
             self._schedule_mic_retry(slow=True)
 
     def _on_listener_state(self, state: str) -> None:
+        if not getattr(self, "_mic_enabled", True):
+            return
         self._listener_state = state
         if self._busy:
             return  # don't override "thinking"/"alice" pills
@@ -2201,6 +2270,8 @@ class TalkToAliceWidget(SiftaBaseWidget):
 
     def _on_listener_failed(self, msg: str) -> None:
         self._listener = None
+        if not getattr(self, "_mic_enabled", True):
+            return
         attempts = getattr(self, "_mic_retry_attempts", 0)
         if attempts < self._MIC_RETRY_MAX_ATTEMPTS:
             # Aggressive window — show a transient hint, retry quietly.
@@ -2779,6 +2850,10 @@ class TalkToAliceWidget(SiftaBaseWidget):
         self._return_to_listening()
 
     def _return_to_listening(self) -> None:
+        if not getattr(self, "_mic_enabled", True):
+            self._set_pill("muted", "🔇 mic off — type to talk")
+            self.set_status("Microphone off. Text chat still works.")
+            return
         self._set_pill("idle", "🎙  listening — just talk")
         self.set_status("Always-on. Just talk.")
 

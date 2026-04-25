@@ -70,7 +70,7 @@ _DEVICE_EVENTS_LOG = _REPO / ".sifta_state" / "device_events.jsonl"
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from PyQt6.QtCore import Qt, QPointF, QRectF, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import QCameraPermission, Qt, QPointF, QRectF, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QFont, QImage, QPainter, QPen, QBrush, QFontMetrics,
 )
@@ -837,6 +837,8 @@ class WhatAliceSeesWidget(SiftaBaseWidget):
 
         # ── Camera + capture session (Qt's built-in ffmpeg backend) ────────
         self._camera: Optional[QCamera] = None
+        self._camera_permission: Optional[QCameraPermission] = None
+        self._camera_permission_pending = False
         self._sink = QVideoSink(self)
         self._session = QMediaCaptureSession(self)
         self._session.setVideoSink(self._sink)
@@ -924,7 +926,54 @@ class WhatAliceSeesWidget(SiftaBaseWidget):
         self.make_timer(500, self._poll_saccade_target)
 
     # ── Camera plumbing ────────────────────────────────────────────────────
+    def _ensure_camera_permission(self) -> bool:
+        app = QApplication.instance()
+        if app is None or not hasattr(app, "checkPermission"):
+            return True
+
+        permission = QCameraPermission()
+        status = app.checkPermission(permission)
+        if status == Qt.PermissionStatus.Granted:
+            self._camera_permission_pending = False
+            return True
+
+        if status == Qt.PermissionStatus.Undetermined and not self._camera_permission_pending:
+            self._camera_permission_pending = True
+            self._camera_permission = permission
+            self._canvas.set_error(
+                "macOS is asking for Camera permission.\n\n"
+                "Click Allow for Python or Terminal, then Alice will connect."
+            )
+            self.set_status("Camera permission requested")
+            app.requestPermission(permission, self._on_camera_permission)
+            return False
+
+        self._canvas.set_error(
+            "Camera permission is not granted.\n\n"
+            "Open System Settings -> Privacy & Security -> Camera, enable "
+            "Python or Terminal, then restart SIFTA."
+        )
+        self.set_status("Camera permission denied")
+        return False
+
+    def _on_camera_permission(self, status) -> None:  # type: ignore[no-untyped-def]
+        self._camera_permission_pending = False
+        self._camera_permission = None
+        if status == Qt.PermissionStatus.Granted:
+            self.set_status("Camera permission granted")
+            QTimer.singleShot(0, self._refresh_cameras)
+            return
+        self._canvas.set_error(
+            "Camera permission was not granted.\n\n"
+            "Open System Settings -> Privacy & Security -> Camera, enable "
+            "Python or Terminal, then restart SIFTA."
+        )
+        self.set_status("Camera permission denied")
+
     def _refresh_cameras(self) -> None:
+        if not self._ensure_camera_permission():
+            return
+
         # Remember current selection (by id) so we don't yank the user mid-stream.
         current_id = None
         if self._cam_combo.count() > 0:
