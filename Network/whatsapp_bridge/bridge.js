@@ -18,6 +18,14 @@ import qrcode from "qrcode-terminal";
 import http from "http";
 import fs from "fs";
 
+process.on("unhandledRejection", (err) => {
+  console.error("[BRIDGE] Unhandled async error kept alive:", err?.message || err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[BRIDGE] Uncaught error kept alive:", err?.message || err);
+});
+
 const SIFTA_SERVER = "http://localhost:7434/swarm_message";
 const MAX_WA_TEXT_TO_SIFTA = 8192;
 const MAX_INJECT_BODY = 16384;

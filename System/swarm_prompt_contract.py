@@ -42,7 +42,7 @@ def tool_affordances_for_turn(user_text: str) -> str:
             "- If asked whether Alice can send a new WhatsApp message from the desktop, say: not by default; "
             "desktop-initiated sending requires an explicit allowlisted local bridge configuration.\n"
             "- Normal WhatsApp users do not know JIDs. To create a safe target nickname, tell the user to send this from the target WhatsApp chat: Alice remember this chat as <nickname>.\n"
-            "- If the user gives a display name like Carltonn, first call whatsapp.bridge.resolve_contact with {\"target\":\"Carltonn\"}. "
+            "- If the user gives a display name like Carlton, first call whatsapp.bridge.resolve_contact with {\"target\":\"Carlton\"}. "
             "If exactly one match exists, use that resolved target/cache. If zero or multiple matches exist, ask the user to choose or save a nickname from the target chat.\n"
             "- List saved local target nicknames with:\n"
             "  <bash>PYTHONPATH=. python3 -m System.whatsapp_bridge_autopilot aliases</bash>\n"

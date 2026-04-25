@@ -95,7 +95,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "properties": {
                 "to": {
                     "type": "string",
-                    "description": "Saved local nickname, e.g. carltonn, or exact allowlisted WhatsApp JID.",
+                    "description": "Saved local nickname, e.g. carlton, or exact allowlisted WhatsApp JID.",
                 },
                 "message": {
                     "type": "string",
