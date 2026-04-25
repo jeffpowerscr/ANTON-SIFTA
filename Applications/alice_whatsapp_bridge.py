@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -27,11 +28,13 @@ from System.sifta_inference_defaults import resolve_ollama_model
 STATE_DIR = REPO_ROOT / ".sifta_state"
 MEMORY_PATH = STATE_DIR / "whatsapp_alice_memory.json"
 SIGNAL_PATH = STATE_DIR / "whatsapp_alice_signals.jsonl"
+ALIAS_PATH = STATE_DIR / "whatsapp_alice_aliases.json"
 
 OLLAMA_URL = os.environ.get("SIFTA_OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 MAX_TEXT_CHARS = int(os.environ.get("SIFTA_WHATSAPP_MAX_TEXT_CHARS", "4096"))
 MAX_HISTORY_ITEMS = int(os.environ.get("SIFTA_WHATSAPP_HISTORY_ITEMS", "10"))
 REQUEST_TIMEOUT_S = float(os.environ.get("SIFTA_WHATSAPP_OLLAMA_TIMEOUT", "180"))
+_ALIAS_RE = re.compile(r"^(?:remember|save|link)\s+(?:this\s+)?chat\s+as\s+([a-zA-Z0-9_. -]{1,48})\s*$", re.I)
 
 
 def _allowed_jids() -> set[str]:
@@ -44,6 +47,41 @@ def _is_allowed_jid(from_jid: str, participant: str = "") -> bool:
     if not allowed:
         return True
     return from_jid in allowed or bool(participant and participant in allowed)
+
+
+def normalize_alias(alias: str) -> str:
+    alias = re.sub(r"\s+", "-", (alias or "").strip().lower())
+    alias = re.sub(r"[^a-z0-9_.-]", "", alias)
+    return alias[:48]
+
+
+def _load_aliases() -> dict[str, dict[str, Any]]:
+    if not ALIAS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(ALIAS_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_alias(alias: str, jid: str, *, is_group: bool, participant: str = "") -> dict[str, Any]:
+    key = normalize_alias(alias)
+    if not key:
+        return {"ok": False, "error": "invalid_alias"}
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    aliases = _load_aliases()
+    aliases[key] = {
+        "jid": jid,
+        "jid_hash": _contact_key(jid),
+        "is_group": bool(is_group),
+        "participant_hash": _contact_key(participant) if participant else "",
+        "saved_at": time.time(),
+    }
+    ALIAS_PATH.write_text(json.dumps(aliases, indent=2), encoding="utf-8")
+    return {"ok": True, "alias": key}
 
 
 def _contact_key(jid: str) -> str:
@@ -150,6 +188,16 @@ def handle_whatsapp_payload(
         return "_SILENT_"
 
     _append_signal(from_jid, text, from_me=from_me, is_group=is_group)
+
+    alias_match = _ALIAS_RE.match(text)
+    if alias_match:
+        saved = save_alias(alias_match.group(1), from_jid, is_group=is_group, participant=participant)
+        if saved.get("ok"):
+            return (
+                f"I saved this WhatsApp chat locally as '{saved['alias']}'. "
+                "Use that nickname for a controlled outbound test."
+            )
+        return "I could not save that WhatsApp nickname. Try a short letters-and-numbers name."
 
     memory = _load_memory()
     key = _contact_key(from_jid)

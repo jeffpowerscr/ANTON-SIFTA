@@ -912,6 +912,42 @@ _BARE_JSON_TOOL_RE = re.compile(
     flags=re.DOTALL | re.MULTILINE,
 )
 
+_STRUCTURED_TOOL_RE = re.compile(
+    r"<(?:tool_call|execute_tool)\b[^>]*>(.*?)(?:</(?:tool_call|execute_tool)>?|$)",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
+def _extract_registered_tool_calls(text: str) -> list[dict]:
+    """Parse registered JSON tool calls from model output.
+
+    Accepted shapes:
+      <tool_call>{"name":"whatsapp.bridge.status","arguments":{}}</tool_call>
+      <execute_tool>{"tool_name":"whatsapp.bridge.aliases","arguments":{}}</execute_tool>
+    """
+    calls: list[dict] = []
+    if not text:
+        return calls
+    for match in _STRUCTURED_TOOL_RE.finditer(text):
+        body = (match.group(1) or "").strip()
+        if not body:
+            continue
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        name = data.get("name") or data.get("tool_name") or data.get("tool")
+        args = data.get("arguments")
+        if args is None:
+            args = data.get("parameters")
+        if args is None:
+            args = {}
+        if name:
+            calls.append({"name": str(name), "arguments": args})
+    return calls
+
 
 def _strip_tool_hallucinations(text: str) -> str:
     """Remove model-invented tool wrappers before TTS sees them."""
@@ -2740,7 +2776,72 @@ class TalkToAliceWidget(SiftaBaseWidget):
         # either canonical <bash> or model-invented <execute_bash>.
         raw = _canonicalize_tool_tags(raw)
 
-        # ── 1. AGENTIC TOOL EXECUTION (BASH OROBOROS) ──────────────
+        # ── 1. REGISTERED JSON TOOL EXECUTION ─────────────────────
+        # Safer named-tool layer for capabilities with schemas. This catches
+        # <tool_call>{"name":"whatsapp.bridge.status","arguments":{}}</tool_call>
+        # before the generic hallucinated-tool scrubber can remove it.
+        structured_tool_calls = _extract_registered_tool_calls(raw)
+        if structured_tool_calls:
+            if getattr(self, "_tool_loop_depth", 0) >= 3:
+                self._append_system_line("tool depth limit reached.", error=False)
+            else:
+                self._tool_loop_depth = getattr(self, "_tool_loop_depth", 0) + 1
+                tool_results = []
+                try:
+                    from System.sifta_tool_registry import execute_tool_call
+                    for call in structured_tool_calls:
+                        name = str(call.get("name") or "")
+                        args = call.get("arguments") or {}
+                        self._append_system_line(
+                            f"Alice using registered tool (depth {self._tool_loop_depth}/3): {name}",
+                            error=False,
+                        )
+                        result = execute_tool_call(name, args)
+                        tool_results.append(
+                            f"Output of registered tool `{name}`:\n"
+                            f"{json.dumps(result, indent=2)[:2000]}"
+                        )
+                except Exception as exc:
+                    tool_results.append(f"Error running registered tool: {exc}")
+
+                self._history.append({"role": "system", "content": "(TOOL LOOP CALLBACK)\n\n" + "\n\n".join(tool_results)})
+                self._end_alice_streaming_line()
+
+                model_name_next = self._current_brain_model()
+                _ua = any(h.get("role") == "user" for h in self._history[-6:])
+                prior_tool_user_text = ""
+                for _msg in reversed(self._history):
+                    if _msg.get("role") == "user":
+                        prior_tool_user_text = str(_msg.get("content") or "")
+                        break
+                messages = [
+                    {
+                        "role": "system",
+                        "content": _current_system_prompt(
+                            user_active=_ua,
+                            user_text=prior_tool_user_text,
+                        ),
+                    }
+                ] + self._history
+
+                try:
+                    self._brain.tokenReceived.disconnect(self._on_token)
+                    self._brain.done.disconnect(self._on_brain_done)
+                    self._brain.failed.disconnect(self._on_brain_failed)
+                except Exception:
+                    pass
+
+                self._brain = _BrainWorker(model_name_next, messages, parent=self)
+                self._brain.tokenReceived.connect(self._on_token)
+                self._brain.done.connect(self._on_brain_done)
+                self._brain.failed.connect(self._on_brain_failed)
+                self._set_pill("thinking", f"thinking — {model_name_next}")
+                self._streaming_response = []
+                self._begin_alice_streaming_line()
+                self._brain.start()
+                return
+
+        # ── 2. AGENTIC TOOL EXECUTION (BASH OROBOROS) ──────────────
         # Forgiving regex: Gemma sometimes drops the trailing ">" of the
         # closing tag or runs out of tokens before closing it at all. We
         # accept three shapes so the architect doesn't lose a tool call to

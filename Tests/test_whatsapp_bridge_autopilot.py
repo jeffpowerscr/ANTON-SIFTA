@@ -18,7 +18,7 @@ def test_autopilot_send_blocks_without_target():
     result = autopilot.send_message(to="", message="hello")
 
     assert result["ok"] is False
-    assert result["error"] == "missing_target_jid"
+    assert result["error"] == "missing_target"
 
 
 def test_autopilot_send_blocks_unallowlisted_target(monkeypatch):
@@ -30,6 +30,78 @@ def test_autopilot_send_blocks_unallowlisted_target(monkeypatch):
 
     assert result["ok"] is False
     assert result["error"] == "target_not_allowlisted"
+
+
+def test_autopilot_resolves_saved_alias(tmp_path, monkeypatch):
+    from System import whatsapp_bridge_autopilot as autopilot
+
+    alias_path = tmp_path / "aliases.json"
+    alias_path.write_text(
+        '{"carltonn": {"jid": "target@s.whatsapp.net", "jid_hash": "x"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(autopilot, "ALIAS_PATH", alias_path)
+
+    result = autopilot.resolve_target("Carltonn")
+
+    assert result["ok"] is True
+    assert result["jid"] == "target@s.whatsapp.net"
+    assert result["alias"] == "carltonn"
+
+
+def test_autopilot_resolves_unique_contact_name_and_caches_alias(tmp_path, monkeypatch):
+    from System import whatsapp_bridge_autopilot as autopilot
+
+    contacts_path = tmp_path / "contacts.json"
+    aliases_path = tmp_path / "aliases.json"
+    contacts_path.write_text(
+        """
+        {
+          "schema_version": 1,
+          "contacts": {
+            "target@s.whatsapp.net": {
+              "jid": "target@s.whatsapp.net",
+              "display_names": ["Carltonn"]
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(autopilot, "CONTACTS_PATH", contacts_path)
+    monkeypatch.setattr(autopilot, "ALIAS_PATH", aliases_path)
+
+    result = autopilot.resolve_target("Carltonn")
+
+    assert result["ok"] is True
+    assert result["jid"] == "target@s.whatsapp.net"
+    assert result["alias"] == "carltonn"
+    assert "carltonn" in aliases_path.read_text(encoding="utf-8")
+
+
+def test_autopilot_reports_ambiguous_contact_name(tmp_path, monkeypatch):
+    from System import whatsapp_bridge_autopilot as autopilot
+
+    contacts_path = tmp_path / "contacts.json"
+    contacts_path.write_text(
+        """
+        {
+          "contacts": {
+            "one@s.whatsapp.net": {"jid": "one@s.whatsapp.net", "display_names": ["Carltonn"]},
+            "two@s.whatsapp.net": {"jid": "two@s.whatsapp.net", "display_names": ["Carltonn"]}
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(autopilot, "CONTACTS_PATH", contacts_path)
+    monkeypatch.setattr(autopilot, "ALIAS_PATH", tmp_path / "aliases.json")
+
+    result = autopilot.resolve_target("Carltonn")
+
+    assert result["ok"] is False
+    assert result["error"] == "ambiguous_contact_name"
+    assert len(result["matches"]) == 2
 
 
 def test_autopilot_send_blocks_without_inject_key(monkeypatch):
@@ -50,5 +122,6 @@ def test_prompt_contract_names_autopilot_send_tool():
     hint = tool_affordances_for_turn("send a whatsapp message")
 
     assert "System.whatsapp_bridge_autopilot status" in hint
-    assert "System.whatsapp_bridge_autopilot send" in hint
-    assert "exact allowlisted WhatsApp JID" in hint
+    assert "whatsapp.bridge.resolve_contact" in hint
+    assert "whatsapp.bridge.send" in hint
+    assert "display name like Carltonn" in hint

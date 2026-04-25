@@ -16,6 +16,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
 import http from "http";
+import fs from "fs";
 
 const SIFTA_SERVER = "http://localhost:7434/swarm_message";
 const MAX_WA_TEXT_TO_SIFTA = 8192;
@@ -32,23 +33,111 @@ const ALLOWED_JIDS = new Set(
     .map((item) => item.trim())
     .filter(Boolean)
 );
+const ALLOWED_ALIASES = new Set(
+  (process.env.SIFTA_WHATSAPP_ALLOWED_ALIASES || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+);
+const ALIASES_FILE = "../../.sifta_state/whatsapp_alice_aliases.json";
+const CONTACTS_FILE = "../../.sifta_state/whatsapp_contacts.json";
 let lastKnownHuman = null;
 
+function loadJsonFile(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonFile(file, data) {
+  try {
+    fs.mkdirSync("../../.sifta_state", { recursive: true });
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    console.error(`[CONTACT CACHE] Failed to write ${file}:`, err?.message || err);
+  }
+}
+
+function cleanName(value) {
+  return (typeof value === "string" ? value : "").replace(/\s+/g, " ").trim();
+}
+
+function mergeNames(existing, candidates) {
+  const names = new Set(Array.isArray(existing) ? existing.filter(Boolean) : []);
+  for (const item of candidates) {
+    const name = cleanName(item);
+    if (name) names.add(name);
+  }
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
+function cacheContact(jid, fields = {}, source = "unknown") {
+  const id = cleanName(jid);
+  if (!id || !id.includes("@")) return;
+  const data = loadJsonFile(CONTACTS_FILE, { schema_version: 1, contacts: {} });
+  if (!data.contacts || typeof data.contacts !== "object") data.contacts = {};
+  const prior = data.contacts[id] || {};
+  const displayNames = mergeNames(prior.display_names, [
+    fields.name,
+    fields.notify,
+    fields.pushName,
+    fields.verifiedName,
+    fields.subject,
+    fields.displayName,
+  ]);
+  const sourceList = new Set(Array.isArray(prior.sources) ? prior.sources : []);
+  sourceList.add(source);
+  data.contacts[id] = {
+    jid: id,
+    display_names: displayNames,
+    name: displayNames[0] || prior.name || "",
+    is_group: Boolean(fields.isGroup || id.endsWith("@g.us")),
+    last_seen_at: Date.now() / 1000,
+    sources: [...sourceList].sort(),
+  };
+  data.updated_at = Date.now() / 1000;
+  writeJsonFile(CONTACTS_FILE, data);
+}
+
+function aliasAllowedTargets() {
+  if (ALLOWED_ALIASES.size === 0) return new Set();
+  try {
+    const raw = JSON.parse(fs.readFileSync(ALIASES_FILE, "utf8"));
+    const targets = new Set();
+    for (const alias of ALLOWED_ALIASES) {
+      const jid = raw?.[alias]?.jid;
+      if (typeof jid === "string" && jid.trim()) targets.add(jid.trim());
+    }
+    return targets;
+  } catch {
+    return new Set();
+  }
+}
+
 function isAllowedChat(from, participant = "") {
-  if (ALLOWED_JIDS.size === 0) return true;
-  return ALLOWED_JIDS.has(from) || (participant && ALLOWED_JIDS.has(participant));
+  const aliasTargets = aliasAllowedTargets();
+  if (ALLOWED_JIDS.size === 0 && aliasTargets.size === 0) return true;
+  return (
+    ALLOWED_JIDS.has(from) ||
+    aliasTargets.has(from) ||
+    (participant && (ALLOWED_JIDS.has(participant) || aliasTargets.has(participant)))
+  );
 }
 
 function validateSafetyConfig() {
-  const riskyBroadcast = SEND_REPLIES && ALLOWED_JIDS.size === 0 && (!REQUIRE_TRIGGER || ALLOW_GROUPS);
-  const riskyInject = ENABLE_INJECT && ALLOWED_JIDS.size === 0;
+  const riskyBroadcast = SEND_REPLIES && ALLOWED_JIDS.size === 0 && ALLOWED_ALIASES.size === 0 && (!REQUIRE_TRIGGER || ALLOW_GROUPS);
+  const riskyInject = ENABLE_INJECT && ALLOWED_JIDS.size === 0 && ALLOWED_ALIASES.size === 0;
   if (riskyBroadcast) {
     console.error("[SIFTA SAFETY] Refusing wide-open WhatsApp replies.");
     console.error("[SIFTA SAFETY] Use trigger words, set SIFTA_WHATSAPP_SEND_REPLIES=0, or set SIFTA_WHATSAPP_ALLOWED_JIDS.");
     process.exit(2);
   }
   if (riskyInject) {
-    console.error("[SIFTA SAFETY] Refusing outbound injection without SIFTA_WHATSAPP_ALLOWED_JIDS.");
+    console.error("[SIFTA SAFETY] Refusing outbound injection without SIFTA_WHATSAPP_ALLOWED_JIDS or SIFTA_WHATSAPP_ALLOWED_ALIASES.");
     process.exit(2);
   }
 }
@@ -115,6 +204,30 @@ async function connectToWhatsApp() {
 
   sock.ev.on("creds.update", saveCreds);
 
+  sock.ev.on("contacts.upsert", (contacts) => {
+    for (const contact of contacts || []) {
+      cacheContact(contact.id, contact, "contacts.upsert");
+    }
+  });
+
+  sock.ev.on("contacts.update", (contacts) => {
+    for (const contact of contacts || []) {
+      cacheContact(contact.id, contact, "contacts.update");
+    }
+  });
+
+  sock.ev.on("chats.upsert", (chats) => {
+    for (const chat of chats || []) {
+      cacheContact(chat.id, { ...chat, isGroup: String(chat.id || "").endsWith("@g.us") }, "chats.upsert");
+    }
+  });
+
+  sock.ev.on("chats.update", (chats) => {
+    for (const chat of chats || []) {
+      cacheContact(chat.id, { ...chat, isGroup: String(chat.id || "").endsWith("@g.us") }, "chats.update");
+    }
+  });
+
   // Track IDs of messages the Swarm sent, to avoid replying to its own replies
   const sentBySwarm = new Set();
 
@@ -132,6 +245,10 @@ async function connectToWhatsApp() {
       const fromMe = Boolean(msg.key.fromMe);
       const isGroup = Boolean(from && from.endsWith("@g.us"));
       const participant = msg.key.participant || "";
+      cacheContact(from, { pushName: msg.pushName, isGroup }, "messages.upsert");
+      if (participant) {
+        cacheContact(participant, { pushName: msg.pushName, isGroup: false }, "messages.upsert.participant");
+      }
       const text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||

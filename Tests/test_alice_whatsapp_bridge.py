@@ -62,3 +62,20 @@ def test_whatsapp_bridge_honors_allowed_jids(tmp_path, monkeypatch):
 
     assert blocked == "_SILENT_"
     assert allowed == "ok: alice hello"
+
+
+def test_whatsapp_bridge_saves_alias_from_chat(tmp_path, monkeypatch):
+    from Applications import alice_whatsapp_bridge as bridge
+
+    monkeypatch.setattr(bridge, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "MEMORY_PATH", tmp_path / "memory.json")
+    monkeypatch.setattr(bridge, "SIGNAL_PATH", tmp_path / "signals.jsonl")
+    monkeypatch.setattr(bridge, "ALIAS_PATH", tmp_path / "aliases.json")
+
+    reply = bridge.handle_whatsapp_payload(
+        {"from": "target@s.whatsapp.net", "text": "remember this chat as Carlton N"},
+        query_fn=lambda _text, _history: "should not run",
+    )
+
+    assert "carlton-n" in reply
+    assert bridge.ALIAS_PATH.exists()
