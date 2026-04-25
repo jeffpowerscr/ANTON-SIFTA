@@ -83,7 +83,7 @@ class NetworkCenterWidget(QWidget):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
         grid.addWidget(_card("Telegram", "Bot token + optional target chat ID for startup ping."), 0, 0)
-        grid.addWidget(_card("WhatsApp", "Launch Baileys QR bridge and SIFTA voice channel."), 0, 1)
+        grid.addWidget(_card("WhatsApp", "Launch Alice's reply-only QR bridge. Say \"Alice ...\" to trigger."), 0, 1)
         grid.addWidget(_card("Discord", "Optional token for users who run a Discord bot."), 0, 2)
         root.addLayout(grid)
 
@@ -116,9 +116,9 @@ class NetworkCenterWidget(QWidget):
         tg_btn.clicked.connect(lambda: self._run(["python3", "Applications/telegram_swarm.py"]))
         btn_row.addWidget(tg_btn)
 
-        wa_btn = QPushButton("Launch WhatsApp (QR)")
+        wa_btn = QPushButton("Launch WhatsApp Alice (QR)")
         wa_btn.setObjectName("secondary")
-        wa_btn.clicked.connect(lambda: self._run(["/bin/bash", "start_swarm_whatsapp.sh"]))
+        wa_btn.clicked.connect(lambda: self._run(["/bin/bash", "scripts/start_swarm_whatsapp.sh"]))
         btn_row.addWidget(wa_btn)
 
         dc_btn = QPushButton("Launch Discord")
@@ -215,4 +215,3 @@ class NetworkCenterWidget(QWidget):
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self._stop_proc()
         super().closeEvent(event)
-

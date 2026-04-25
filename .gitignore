@@ -109,6 +109,8 @@ static/
 # ── WhatsApp Bridge runtime ───────────────────────────────────────────────────
 whatsapp_bridge/whatsapp_session/
 whatsapp_bridge/node_modules/
+Network/whatsapp_bridge/whatsapp_session/
+Network/whatsapp_bridge/node_modules/
 wormhole.log
 
 # ── Node ──────────────────────────────────────────────────────────────────────
@@ -154,4 +156,3 @@ implementation_plan.md
 
 # Personal Sandbox
 .personal/
-

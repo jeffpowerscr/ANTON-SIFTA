@@ -21,7 +21,55 @@ const SIFTA_SERVER = "http://localhost:7434/swarm_message";
 const MAX_WA_TEXT_TO_SIFTA = 8192;
 const MAX_INJECT_BODY = 16384;
 const INJECT_KEY = process.env.SIFTA_BRIDGE_INJECT_KEY || "";
+const TRIGGER_WORD = (process.env.SIFTA_WHATSAPP_TRIGGER || "alice").trim().toLowerCase();
+const REQUIRE_TRIGGER = process.env.SIFTA_WHATSAPP_REQUIRE_TRIGGER !== "0";
+const ALLOW_GROUPS = process.env.SIFTA_WHATSAPP_ALLOW_GROUPS === "1";
+const SEND_REPLIES = process.env.SIFTA_WHATSAPP_SEND_REPLIES !== "0";
+const ENABLE_INJECT = process.env.SIFTA_WHATSAPP_ENABLE_INJECT === "1";
+const ALLOWED_JIDS = new Set(
+  (process.env.SIFTA_WHATSAPP_ALLOWED_JIDS || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+);
 let lastKnownHuman = null;
+
+function isAllowedChat(from, participant = "") {
+  if (ALLOWED_JIDS.size === 0) return true;
+  return ALLOWED_JIDS.has(from) || (participant && ALLOWED_JIDS.has(participant));
+}
+
+function validateSafetyConfig() {
+  const riskyBroadcast = SEND_REPLIES && ALLOWED_JIDS.size === 0 && (!REQUIRE_TRIGGER || ALLOW_GROUPS);
+  const riskyInject = ENABLE_INJECT && ALLOWED_JIDS.size === 0;
+  if (riskyBroadcast) {
+    console.error("[SIFTA SAFETY] Refusing wide-open WhatsApp replies.");
+    console.error("[SIFTA SAFETY] Use trigger words, set SIFTA_WHATSAPP_SEND_REPLIES=0, or set SIFTA_WHATSAPP_ALLOWED_JIDS.");
+    process.exit(2);
+  }
+  if (riskyInject) {
+    console.error("[SIFTA SAFETY] Refusing outbound injection without SIFTA_WHATSAPP_ALLOWED_JIDS.");
+    process.exit(2);
+  }
+}
+
+function stripTrigger(text) {
+  const trimmed = (text || "").trim();
+  if (!REQUIRE_TRIGGER) return { ok: true, text: trimmed };
+  const lower = trimmed.toLowerCase();
+  const variants = [
+    `/${TRIGGER_WORD}`,
+    `@${TRIGGER_WORD}`,
+    TRIGGER_WORD,
+  ];
+  for (const variant of variants) {
+    if (lower === variant) return { ok: true, text: "hello" };
+    if (lower.startsWith(`${variant} `)) return { ok: true, text: trimmed.slice(variant.length).trim() };
+    if (lower.startsWith(`${variant},`)) return { ok: true, text: trimmed.slice(variant.length + 1).trim() };
+    if (lower.startsWith(`${variant}:`)) return { ok: true, text: trimmed.slice(variant.length + 1).trim() };
+  }
+  return { ok: false, text: trimmed };
+}
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState("./whatsapp_session");
@@ -45,8 +93,9 @@ async function connectToWhatsApp() {
     }
 
     if (connection === "open") {
-      console.log("\n[🌊 SWARM BRIDGE] WhatsApp connected. The Swarm is listening on your phone.");
-      console.log("[🌊 SWARM BRIDGE] Send a message from your WhatsApp now!\n");
+      console.log("\n[🌊 SWARM BRIDGE] WhatsApp connected in reply-only mode.");
+      console.log(`[🌊 SWARM BRIDGE] Say "${TRIGGER_WORD} ..." in a chat to ask Alice.`);
+      if (!ALLOW_GROUPS) console.log("[🌊 SWARM BRIDGE] Group chats are muted by default.\n");
     }
 
     if (connection === "close") {
@@ -80,6 +129,9 @@ async function connectToWhatsApp() {
       if (sentBySwarm.has(msgId)) { sentBySwarm.delete(msgId); continue; }
 
       const from = msg.key.remoteJid;
+      const fromMe = Boolean(msg.key.fromMe);
+      const isGroup = Boolean(from && from.endsWith("@g.us"));
+      const participant = msg.key.participant || "";
       const text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
@@ -87,23 +139,33 @@ async function connectToWhatsApp() {
         "";
 
       if (!text) continue;
+      if (isGroup && !ALLOW_GROUPS) continue;
+      if (!isAllowedChat(from, participant)) continue;
+      const trigger = stripTrigger(text);
+      if (!trigger.ok) continue;
       const safeText =
-        text.length > MAX_WA_TEXT_TO_SIFTA ? text.slice(0, MAX_WA_TEXT_TO_SIFTA) : text;
+        trigger.text.length > MAX_WA_TEXT_TO_SIFTA
+          ? trigger.text.slice(0, MAX_WA_TEXT_TO_SIFTA)
+          : trigger.text;
 
-      // Track last human we spoke to
-      if (!msg.key.fromMe) {
-          lastKnownHuman = from;
-      }
+      lastKnownHuman = from;
       
       // Infinite loop prevention for offline kernel errors and multi-node echoing
       if (text.includes("🔴 SIFTA kernel is offline")) continue;
       if (text.startsWith("[M1THER]") || text.startsWith("[M5QUEEN]") || text.startsWith("[SIFTA]")) continue;
       if (text.startsWith("🌊") || text.startsWith("🧠📡")) continue;
 
-      console.log(`\n[📲 INCOMING] type=${type} fromMe=${msg.key.fromMe} from=${from}`);
-      console.log(`  Message: "${text}"`);
+      console.log(`\n[📲 INCOMING] type=${type} fromMe=${fromMe} group=${isGroup} from=${from}`);
+      console.log(`  Message to Alice: "${safeText}"`);
 
-      const payload = JSON.stringify({ from, text: safeText });
+      const payload = JSON.stringify({
+        from,
+        text: safeText,
+        rawText: text,
+        fromMe,
+        isGroup,
+        participant,
+      });
 
       const req = http.request(SIFTA_SERVER, {
         method: "POST",
@@ -123,6 +185,10 @@ async function connectToWhatsApp() {
               return;
             }
             const reply = rawVoice || "🌊";
+            if (!SEND_REPLIES) {
+              console.log(`  [ALICE REPLY SUPPRESSED] "${reply.substring(0, 80)}..."`);
+              return;
+            }
             // Show "typing..." like a real conversation
             await sock.sendPresenceUpdate("composing", from);
             await new Promise(r => setTimeout(r, 1200));
@@ -137,9 +203,11 @@ async function connectToWhatsApp() {
       });
 
       req.on("error", () => {
-        sock.sendMessage(from, {
-          text: "🔴 SIFTA kernel is offline. Restart whatsapp_swarm.py.",
-        });
+        if (SEND_REPLIES) {
+          sock.sendMessage(from, {
+            text: "Alice's local bridge is offline. Restart scripts/start_swarm_whatsapp.sh.",
+          });
+        }
       });
 
       req.write(payload);
@@ -147,10 +215,18 @@ async function connectToWhatsApp() {
     }
   });
 
-  // ── AUTONOMOUS INJECTION SERVER ───────────────────────────
+  // ── Optional injection server. Disabled by default; reply-only is safer.
+  if (!ENABLE_INJECT) {
+    console.log("[🌊 SWARM BRIDGE] Outbound injection server disabled (reply-only).");
+    return;
+  }
+  if (!INJECT_KEY) {
+    console.log("[🌊 SWARM BRIDGE] Injection requested, but SIFTA_BRIDGE_INJECT_KEY is missing. Staying reply-only.");
+    return;
+  }
   const injectServer = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/system_inject') {
-        if (INJECT_KEY && req.headers["x-sifta-inject-key"] !== INJECT_KEY) {
+        if (req.headers["x-sifta-inject-key"] !== INJECT_KEY) {
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
           return;
@@ -162,17 +238,18 @@ async function connectToWhatsApp() {
         req.on('end', async () => {
             try {
                 const data = JSON.parse(body);
-                if (lastKnownHuman) {
-                    await sock.sendPresenceUpdate("composing", lastKnownHuman);
+                const target = (typeof data.to === "string" && data.to.trim()) ? data.to.trim() : lastKnownHuman;
+                if (target && typeof data.text === "string" && data.text.trim() && isAllowedChat(target)) {
+                    await sock.sendPresenceUpdate("composing", target);
                     await new Promise(r => setTimeout(r, 1200));
-                    await sock.sendPresenceUpdate("paused", lastKnownHuman);
-                    const sent = await sock.sendMessage(lastKnownHuman, { text: data.text });
+                    await sock.sendPresenceUpdate("paused", target);
+                    const sent = await sock.sendMessage(target, { text: data.text });
                     if (sent?.key?.id) {
                         sentBySwarm.add(sent.key.id);
                     }
-                    console.log(`\n[💉 AUTONOMOUS INJECT] Pushed Wormhole message to WhatsApp: ${data.text.substring(0,60)}...`);
+                    console.log(`\n[INJECT] Pushed explicit message to WhatsApp target=${target}: ${data.text.substring(0,60)}...`);
                 } else {
-                    console.log(`\n[💉 AUTONOMOUS INJECT] Failed. No human contact history recorded yet.`);
+                    console.log(`\n[INJECT] Failed. Missing target/text or target is not allowlisted.`);
                 }
                 res.writeHead(200, {"Content-Type": "application/json"});
                 res.end(JSON.stringify({ok: true}));
@@ -189,12 +266,10 @@ async function connectToWhatsApp() {
   });
   
   injectServer.listen(3001, "127.0.0.1", () => {
-      console.log("[🌊 SWARM BRIDGE] Autonomous Injection Server on 127.0.0.1:3001 (LAN-safe bind)");
-      if (!INJECT_KEY) {
-        console.log("[!] Set SIFTA_BRIDGE_INJECT_KEY to require X-Sifta-Inject-Key on /system_inject");
-      }
+      console.log("[🌊 SWARM BRIDGE] Explicit Injection Server on 127.0.0.1:3001");
   });
 }
 
 console.log("[🌊 SIFTA BRIDGE] Booting WhatsApp connection...");
+validateSafetyConfig();
 connectToWhatsApp();

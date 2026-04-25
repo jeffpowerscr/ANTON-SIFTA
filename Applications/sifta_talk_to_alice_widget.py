@@ -214,6 +214,13 @@ _DEFAULT_WHISPER_MODEL = os.environ.get("SIFTA_WHISPER_MODEL", "tiny.en").strip(
 _GAIN_STATE_FILE   = _REPO / ".sifta_state" / "talk_to_alice_audio_gain.json"
 _AUDIO_SETTINGS_FILE = _REPO / ".sifta_state" / "alice_audio_settings.json"
 
+# Ollama pauses can be long on the full GGUF, especially with grounding
+# context. Do not mistake a quiet socket for a completed thought.
+_OLLAMA_REQUEST_TIMEOUT_S = float(os.environ.get("SIFTA_OLLAMA_REQUEST_TIMEOUT_S", "300"))
+_OLLAMA_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("SIFTA_OLLAMA_STREAM_IDLE_TIMEOUT_S", "45"))
+_OLLAMA_NUM_PREDICT = int(os.environ.get("SIFTA_OLLAMA_NUM_PREDICT", "1200"))
+_OLLAMA_NUM_CTX = int(os.environ.get("SIFTA_OLLAMA_NUM_CTX", "8192"))
+
 # Audio normalization constants used by _peak_normalize / _apply_mic_gain.
 _PEAK_TARGET     = 0.90
 _PEAK_NORM_FLOOR = 0.05
@@ -291,6 +298,7 @@ def _load_alice_audio_settings() -> dict:
         "whisper_model": _DEFAULT_WHISPER_MODEL,
         "voice_name": "",
         "ground_swarm_state": True,
+        "mic_mode": "always_listen",
     }
     try:
         if _AUDIO_SETTINGS_FILE.exists():
@@ -302,6 +310,8 @@ def _load_alice_audio_settings() -> dict:
     settings["whisper_model"] = str(settings.get("whisper_model") or _DEFAULT_WHISPER_MODEL).strip() or _DEFAULT_WHISPER_MODEL
     settings["voice_name"] = str(settings.get("voice_name") or "").strip()
     settings["ground_swarm_state"] = bool(settings.get("ground_swarm_state", True))
+    if settings.get("mic_mode") not in ("always_listen", "push_to_talk", "muted"):
+        settings["mic_mode"] = "always_listen"
     return settings
 
 
@@ -916,6 +926,134 @@ def _strip_tool_hallucinations(text: str) -> str:
     return out.strip()
 
 
+_TRUNCATED_TAIL_WORDS = {
+    "a", "an", "and", "as", "at", "across", "between", "by", "for", "from",
+    "in", "including", "into", "like", "of", "on", "or", "over", "such",
+    "than", "the", "through", "to", "under", "using", "with",
+}
+
+_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+_ROMAN_NUMERALS = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10,
+}
+
+
+def _number_word_to_int(raw: str) -> int:
+    try:
+        return int(raw)
+    except ValueError:
+        return _COUNT_WORDS.get(raw.lower(), _ROMAN_NUMERALS.get(raw.lower(), 0))
+
+
+def _tail_sentence_is_closed(text: str) -> bool:
+    tail = re.sub(r"[*_`~>\s]+$", "", text or "")
+    # Closing quotes/brackets are only terminal if they close real punctuation.
+    while tail and tail[-1] in "\"')]}":
+        tail = tail[:-1].rstrip()
+    return bool(tail) and tail[-1] in ".!?"
+
+
+def _announced_structure_is_incomplete(text: str) -> bool:
+    lower = (text or "").lower()
+    wanted = 0
+    for raw in re.findall(
+        r"\b(?:these|the|following|one of these|broken down into|"
+        r"structure(?:\s+this)?\s+into|structured\s+into|"
+        r"break(?:ing)?\s+(?:this\s+)?(?:down\s+)?into|"
+        r"divid(?:e|ed|ing)\s+(?:this\s+)?into|into)\s+"
+        r"(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b"
+        r"[\w\s,\-]{0,80}?"
+        r"\b(?:vectors|domains|phases|steps|ideas|options|strategies|parts)\b",
+        lower,
+    ):
+        wanted = max(wanted, _number_word_to_int(raw))
+    if wanted < 3:
+        return False
+
+    phase_numbers = {
+        _number_word_to_int(n)
+        for n in re.findall(
+            r"(?im)^\s*(?:#{1,6}\s*)?.{0,24}?\bphase\s+"
+            r"(i|ii|iii|iv|v|vi|vii|viii|ix|x|\d+)\b",
+            text or "",
+        )
+    }
+    phase_numbers.discard(0)
+    if phase_numbers:
+        return max(phase_numbers) < wanted
+
+    numbered = {
+        int(n)
+        for n in re.findall(
+            r"(?m)^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:phase\s*)?(\d+)[\).\:]",
+            text or "",
+        )
+    }
+    if not numbered:
+        numbered = {
+            int(n)
+            for n in re.findall(
+                r"(?m)^\s*(?:#{1,6}\s*)?\*\*(\d+)\.",
+                text or "",
+            )
+        }
+    return bool(numbered) and max(numbered) < wanted
+
+
+def _looks_truncated_reply(text: str) -> bool:
+    """Heuristic guard for local-model streams that stop mid-sentence."""
+    t = (text or "").strip()
+    if len(t) < 80:
+        return False
+    if _announced_structure_is_incomplete(t):
+        return True
+    if t.count("```") % 2 == 1:
+        return True
+    if t[-1] in ",:;/-–—":
+        return True
+    if _tail_sentence_is_closed(t):
+        return False
+
+    tail = re.sub(r"[*_`~>]+$", "", t).strip()
+    if not tail:
+        return True
+    words = re.findall(r"[A-Za-z0-9]+", tail)
+    if not words:
+        return True
+    last = words[-1].lower()
+    previous = words[-2].lower() if len(words) >= 2 else ""
+    if last in _TRUNCATED_TAIL_WORDS:
+        return True
+    if last.isdigit() and previous in {"across", "between", "over", "under", "top", "first", "last"}:
+        return True
+
+    last_terminal = max(t.rfind("."), t.rfind("!"), t.rfind("?"))
+    if last_terminal < 0 or len(t) - last_terminal > 40:
+        return True
+    return False
+
+
 # ── Voice-activity-detected continuous listener ──────────────────────────────
 # Tunables (RMS values are on float32 mic data in [-1, 1]).
 _VAD_BLOCK_S          = 0.05    # 50 ms callback rate
@@ -1271,7 +1409,8 @@ class _BrainWorker(QThread):
                 "repeat_last_n": 256,
                 "frequency_penalty": 0.5,
                 "presence_penalty": 0.3,
-                "num_predict": 700,
+                "num_predict": _OLLAMA_NUM_PREDICT,
+                "num_ctx": _OLLAMA_NUM_CTX,
                 "stop": [
                     "\nYou said:", "You said: \"", "You said:\"",
                     "\nUser:", "\nuser:", "\nAlice:", "\nalice:",
@@ -1298,13 +1437,13 @@ class _BrainWorker(QThread):
             )
             full: List[str] = []
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    # Ollama can occasionally leave an HTTP stream open after
-                    # the final useful token. A short socket timeout lets us
-                    # finalize a non-empty reply instead of leaving the Qt
-                    # worker stuck in "thinking" forever.
+                with urllib.request.urlopen(req, timeout=_OLLAMA_REQUEST_TIMEOUT_S) as resp:
+                    # Ollama can pause for a while on the full local GGUF. Keep
+                    # an idle timeout so the UI never hangs forever, but make
+                    # it long enough that a slow token interval is not treated
+                    # as the end of the answer.
                     try:
-                        resp.fp.raw._sock.settimeout(8.0)
+                        resp.fp.raw._sock.settimeout(_OLLAMA_STREAM_IDLE_TIMEOUT_S)
                     except Exception:
                         pass
                     try:
@@ -1340,7 +1479,12 @@ class _BrainWorker(QThread):
                                 break
                     except (TimeoutError, socket.timeout):
                         if full:
-                            self.done.emit("".join(full).strip())
+                            self.failed.emit(
+                                "Ollama paused mid-answer for "
+                                f"{_OLLAMA_STREAM_IDLE_TIMEOUT_S:.0f}s. "
+                                "I kept the partial text visible; try Send again "
+                                "if you want Alice to continue."
+                            )
                             return
                         raise
                 self.done.emit("".join(full).strip())
@@ -2035,7 +2179,10 @@ class TalkToAliceWidget(SiftaBaseWidget):
         self._tts: Optional[_TTSWorker] = None
         self._streaming_response: List[str] = []
         self._listener_state = "idle"           # for the pill
-        self._mic_enabled = True
+        self._empty_retry_depth = 0
+        self._continuation_depth = 0
+        self._mic_enabled = _load_alice_audio_settings().get("mic_mode") != "muted"
+        self._update_mic_toggle_button()
 
         # Periodic level decay so the bar relaxes when you stop speaking.
         self.make_timer(80, self._decay_level)
@@ -2051,10 +2198,13 @@ class TalkToAliceWidget(SiftaBaseWidget):
         except Exception:
             _greeting = "[UNKNOWN]"
         self._append_alice_line(_greeting)
-        self.set_status("Starting always-on listener…")
-
-        # Kick off the always-on listener (deferred so the window paints first).
-        QTimer.singleShot(150, self._start_listener)
+        if self._mic_enabled:
+            self.set_status("Starting always-on listener…")
+            # Kick off the always-on listener (deferred so the window paints first).
+            QTimer.singleShot(150, self._start_listener)
+        else:
+            self._set_pill("muted", "🔇 mic off — type to talk")
+            self.set_status("Microphone off. Text chat still works.")
 
     def _submit_text_input(self) -> None:
         text = self._text_input.text().strip()
@@ -2149,6 +2299,14 @@ class TalkToAliceWidget(SiftaBaseWidget):
     def _set_mic_enabled(self, enabled: bool) -> None:
         self._mic_enabled = bool(enabled)
         self._update_mic_toggle_button()
+        try:
+            settings = _load_alice_audio_settings()
+            settings["mic_mode"] = "always_listen" if self._mic_enabled else "muted"
+            settings["saved_at"] = time.time()
+            _AUDIO_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _AUDIO_SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
         if not self._mic_enabled:
             try:
@@ -2410,7 +2568,7 @@ class TalkToAliceWidget(SiftaBaseWidget):
         # blocks. The strictest signal is "last entry is a user turn",
         # which is what we just appended at line 2153 above.
         user_active = bool(history) and history[-1].get("role") == "user"
-        sysprompt = _current_system_prompt(user_active=user_active)
+        sysprompt = _current_system_prompt(user_active=user_active, user_text=text)
         if _alice_grounding_enabled():
             ctx = _build_swarm_context()
             if ctx:
@@ -2418,6 +2576,8 @@ class TalkToAliceWidget(SiftaBaseWidget):
         messages = [{"role": "system", "content": sysprompt}] + history
 
         model = self._current_brain_model()
+        self._empty_retry_depth = 0
+        self._continuation_depth = 0
         self._streaming_response = []
         self._begin_alice_streaming_line()
 
@@ -2433,6 +2593,59 @@ class TalkToAliceWidget(SiftaBaseWidget):
         self._streaming_response.append(piece)
         self._append_alice_streaming_chunk(piece)
 
+    def _continue_truncated_reply(self, partial_text: str, model_name: str) -> bool:
+        depth = int(getattr(self, "_continuation_depth", 0) or 0)
+        if depth >= 2:
+            return False
+        self._continuation_depth = depth + 1
+
+        spacer = "\n"
+        self._streaming_response.append(spacer)
+        self._append_alice_streaming_chunk(spacer)
+
+        history = list(self._history)[-(_HISTORY_TURNS * 2):]
+        user_text = ""
+        for msg in reversed(history):
+            if msg.get("role") == "user":
+                user_text = str(msg.get("content") or "")
+                break
+        sysprompt = (
+            _current_system_prompt(user_active=bool(user_text), user_text=user_text)
+            + "\n\nTRUNCATED ANSWER CONTINUATION:\n"
+            "- Your previous answer stopped mid-sentence.\n"
+            "- Continue from the exact point where it stopped.\n"
+            "- Do not repeat earlier text.\n"
+            "- Finish the answer completely and concisely."
+        )
+        messages = [
+            {"role": "system", "content": sysprompt},
+            *history,
+            {"role": "assistant", "content": partial_text},
+            {
+                "role": "user",
+                "content": (
+                    "Continue exactly where your previous answer cut off. "
+                    "Do not restart or repeat. Finish the answer."
+                ),
+            },
+        ]
+
+        try:
+            self._brain.tokenReceived.disconnect(self._on_token)
+            self._brain.done.disconnect(self._on_brain_done)
+            self._brain.failed.disconnect(self._on_brain_failed)
+        except Exception:
+            pass
+
+        self._brain = _BrainWorker(model_name, messages, parent=self)
+        self._brain.tokenReceived.connect(self._on_token)
+        self._brain.done.connect(self._on_brain_done)
+        self._brain.failed.connect(self._on_brain_failed)
+        self._set_pill("thinking", f"💭 continuing — {model_name}")
+        self.set_status("Alice's answer cut off; continuing it…")
+        self._brain.start()
+        return True
+
     def _on_brain_done(self, text: str) -> None:
         """Brain has produced a candidate reply. The model proposes;
         the body decides whether to vocalize it.
@@ -2447,8 +2660,46 @@ class TalkToAliceWidget(SiftaBaseWidget):
              talking, suppress vocalization and log the biological reason.
           4. If SSP green-lights → speak the cleaned reply.
         """
-        raw = (text or "".join(self._streaming_response)).strip()
+        streamed = "".join(self._streaming_response).strip()
+        candidate = (text or "").strip()
+        if streamed and candidate and candidate not in streamed:
+            raw = (streamed + "\n" + candidate).strip()
+        else:
+            raw = (streamed or candidate).strip()
         model_name = self._current_brain_model()
+
+        if not raw:
+            retry_depth = int(getattr(self, "_empty_retry_depth", 0) or 0)
+            if retry_depth < 1:
+                self._empty_retry_depth = retry_depth + 1
+                self._erase_alice_streaming_line()
+                history = list(self._history)[-(_HISTORY_TURNS * 2):]
+                _ua = bool(history) and history[-1].get("role") == "user"
+                retry_user_text = ""
+                for msg in reversed(history):
+                    if msg.get("role") == "user":
+                        retry_user_text = str(msg.get("content") or "")
+                        break
+                retry_prompt = (
+                    _current_system_prompt(user_active=_ua, user_text=retry_user_text)
+                    + "\n\nEMPTY RESPONSE RETRY:\n"
+                    "- Your previous response was empty. Answer the user's latest "
+                    "question directly.\n"
+                    "- Keep the answer complete, practical, and under 8 short paragraphs.\n"
+                    "- Do not return an empty message."
+                )
+                messages = [{"role": "system", "content": retry_prompt}] + history
+                self._brain = _BrainWorker(model_name, messages, parent=self)
+                self._brain.tokenReceived.connect(self._on_token)
+                self._brain.done.connect(self._on_brain_done)
+                self._brain.failed.connect(self._on_brain_failed)
+                self._streaming_response = []
+                self._begin_alice_streaming_line()
+                self._set_pill("thinking", f"💭 retrying — {model_name}")
+                self.set_status("Alice returned empty; retrying once…")
+                self._brain.start()
+                return
+            self._empty_retry_depth = 0
 
         # ── 0a. DECONTAMINATE PRIOR HISTORY ────────────────────────
         # If a previous turn collapsed into echo-loop ("You said: ...")
@@ -2479,6 +2730,7 @@ class TalkToAliceWidget(SiftaBaseWidget):
             # above carries the trace; no need to leave "You said: You
             # said: You said: ..." visible on screen. C47H 2026-04-21.
             self._erase_alice_streaming_line()
+            self._continuation_depth = 0
             self._busy = False
             self._return_to_listening()
             return
@@ -2678,6 +2930,10 @@ class TalkToAliceWidget(SiftaBaseWidget):
             # Epistemic cortex should be visible when degraded; do not fail silently.
             self._append_system_line("(epistemic cortex unavailable; continuing without immune filter)", error=True)
 
+        if _looks_truncated_reply(cleaned):
+            if self._continue_truncated_reply(cleaned, model_name):
+                return
+
         # ── 2. Model-side silence: explicit marker or empty after stripping
         # C47H 2026-04-20: log the raw output verbatim when we suppress,
         # so the next silence-loop trap (e.g. punctuation-as-silence,
@@ -2740,6 +2996,7 @@ class TalkToAliceWidget(SiftaBaseWidget):
             # C47H 2026-04-21.
             self._erase_alice_streaming_line()
             self._append_system_line(note, error=False)
+            self._continuation_depth = 0
             self._busy = False
             self._return_to_listening()
             return
@@ -2762,22 +3019,21 @@ class TalkToAliceWidget(SiftaBaseWidget):
 
             if decision is not None and not decision.speak:
                 # The body is below threshold, in refractory, or vetoed by
-                # the listener. Log the *real* biological reason — never a
-                # hardcoded phrase. The history sees only "(silent)" so the
-                # next turn's model context isn't poisoned by the reason.
-                note = f"(silent: body gate — {decision.reason})"
-                self._history.append({"role": "assistant", "content": "(silent)"})
-                _log_turn("alice", note, model=model_name)
-                # The body vetoed vocalization — tear the streamed block
-                # out of the UI so the Architect doesn't see a reply that
-                # biologically "never happened." C47H 2026-04-21.
-                self._erase_alice_streaming_line()
+                # the listener. That should suppress only the mouth/TTS. The
+                # reply already reached the chat surface, so keep it visible
+                # and keep the honest assistant turn in history.
+                note = f"(voice not spoken: body gate — {decision.reason})"
+                self._history.append({"role": "assistant", "content": cleaned})
+                _log_turn("alice", cleaned, model=model_name)
+                self._end_alice_streaming_line()
                 self._append_system_line(note, error=False)
+                self._continuation_depth = 0
                 self._busy = False
                 self._return_to_listening()
                 return
 
         # ── 4. Body said yes (or SSP unavailable) — speak the cleaned reply
+        self._continuation_depth = 0
         self._history.append({"role": "assistant", "content": cleaned})
         _log_turn("alice", cleaned, model=model_name)
         self._end_alice_streaming_line()
@@ -2831,6 +3087,7 @@ class TalkToAliceWidget(SiftaBaseWidget):
 
     def _on_brain_failed(self, msg: str) -> None:
         self._busy = False
+        self._continuation_depth = 0
         self._end_alice_streaming_line()
         self._append_system_line(msg, error=True)
         self.set_status("Brain unreachable.")
@@ -2968,10 +3225,10 @@ class TalkToAliceWidget(SiftaBaseWidget):
                     r"<(?:bash|execute_bash)>.*?(?:</(?:bash|execute_bash)>?|$)", "", canon, flags=re.DOTALL | re.IGNORECASE
                 )
                 visible = _strip_tool_hallucinations(visible).strip()
-                # If everything was tool-tag noise, leave a quiet marker
-                # rather than a confusing empty Alice block.
+                # If everything was a tool call, show that Alice is checking
+                # live data instead of rendering a confusing "(silent)" block.
                 if not visible:
-                    visible = "(silent)"
+                    visible = "(checking live data...)"
                 cur = self._chat.textCursor()
                 cur.setPosition(body_start)
                 cur.movePosition(

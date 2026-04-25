@@ -1894,3 +1894,5 @@
 {"ts": 1777137158.261072, "app": "proof_of_useful_work", "reason": "MINING_YIELD_MEMORY_RECALL_BY_MEMORY_SWIMMER_IOAN_M5", "amount": 50.0, "trace_id": "a96925885d444cde"}
 {"ts": 1777053437.071104, "app": "swarm_epistemic_cortex", "reason": "EPISTEMIC_DISSONANCE:EPI_CORTEX_1307b53e5a", "amount": -5.0, "trace_id": "STGM_DEBIT_fa19f5dcf5"}
 {"ts": 1777134520.414486, "app": "swarm_epistemic_cortex", "reason": "EPISTEMIC_DISSONANCE:EPI_CORTEX_00be8015e6", "amount": -5.0, "trace_id": "STGM_DEBIT_71c1d39238"}
+{"ts": 1777153552.150371, "app": "swarm_epistemic_cortex", "reason": "EPISTEMIC_DISSONANCE:EPI_CORTEX_d21bfaa230", "amount": -5.0, "trace_id": "STGM_DEBIT_e0edecb4cd"}
+{"ts": 1777153736.673171, "app": "swarm_epistemic_cortex", "reason": "EPISTEMIC_DISSONANCE:EPI_CORTEX_b1162ba27b", "amount": -5.0, "trace_id": "STGM_DEBIT_8941df793b"}

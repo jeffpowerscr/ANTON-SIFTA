@@ -134,6 +134,7 @@ def _load_audio_settings() -> dict[str, Any]:
         "whisper_model": DEFAULT_WHISPER_MODEL,
         "voice_name": "",
         "ground_swarm_state": True,
+        "mic_mode": "always_listen",
     }
     try:
         data = json.loads(AUDIO_SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -146,6 +147,8 @@ def _load_audio_settings() -> dict[str, Any]:
         settings["whisper_model"] = DEFAULT_WHISPER_MODEL
     settings["voice_name"] = str(settings.get("voice_name") or "")
     settings["ground_swarm_state"] = bool(settings.get("ground_swarm_state", True))
+    if settings.get("mic_mode") not in ("always_listen", "push_to_talk", "muted"):
+        settings["mic_mode"] = "always_listen"
     return settings
 
 
@@ -431,9 +434,10 @@ class SystemSettingsWidget(SiftaBaseWidget):
         settings = _load_audio_settings()
         voice = settings["voice_name"] or "Alice Default"
         grounding = "grounded" if settings["ground_swarm_state"] else "ungrounded"
+        mic_mode = str(settings.get("mic_mode") or "always_listen").replace("_", " ")
         self.audio_status_card.set_metric(
             f"{settings['whisper_model']} · {_load_mic_gain():.1f}x",
-            f"{voice}; {grounding}",
+            f"{voice}; {grounding}; mic {mic_mode}",
         )
 
     def _body_page(self) -> QWidget:
