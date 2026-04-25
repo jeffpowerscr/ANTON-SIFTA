@@ -60,6 +60,7 @@ import json
 import importlib
 import os
 import re
+import shlex
 import socket
 import shutil
 import subprocess
@@ -947,6 +948,102 @@ def _extract_registered_tool_calls(text: str) -> list[dict]:
         if name:
             calls.append({"name": str(name), "arguments": args})
     return calls
+
+
+def _registered_tool_call_from_shell_command(cmd: str) -> dict | None:
+    """Convert model-invented shell syntax for registered tools to JSON calls.
+
+    Gemma occasionally emits `<bash>whatsapp.bridge.send ...</bash>` even
+    after being shown the `<tool_call>` form. Treat those as named local tools
+    rather than letting `/bin/sh` look for an executable named
+    `whatsapp.bridge.send`.
+    """
+    raw = (cmd or "").strip()
+    if not raw:
+        return None
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    name = parts[0].strip()
+    registered = {
+        "whatsapp.bridge.status",
+        "whatsapp.bridge.aliases",
+        "whatsapp.bridge.resolve_contact",
+        "whatsapp.bridge.send",
+    }
+    if name not in registered:
+        return None
+
+    json_tail = raw[len(name):].strip()
+    if json_tail.startswith("{"):
+        try:
+            parsed = json.loads(json_tail)
+            if isinstance(parsed, dict):
+                return {"name": name, "arguments": parsed}
+        except json.JSONDecodeError:
+            pass
+
+    args: dict[str, str] = {}
+    positional: list[str] = []
+    i = 1
+    while i < len(parts):
+        token = parts[i]
+        if token in {"--to", "--jid"} and i + 1 < len(parts):
+            args["to"] = parts[i + 1]
+            i += 2
+            continue
+        if token in {"--target", "--name"} and i + 1 < len(parts):
+            args["target"] = parts[i + 1]
+            i += 2
+            continue
+        if token in {"--message", "--text", "--payload"} and i + 1 < len(parts):
+            i += 1
+            message_parts: list[str] = []
+            while i < len(parts) and not parts[i].startswith("--"):
+                message_parts.append(parts[i])
+                i += 1
+            args["message"] = " ".join(message_parts)
+            continue
+        if token.startswith("--to=") or token.startswith("--jid="):
+            args["to"] = token.split("=", 1)[1]
+        elif token.startswith("--target=") or token.startswith("--name="):
+            args["target"] = token.split("=", 1)[1]
+        elif token.startswith("--message=") or token.startswith("--text=") or token.startswith("--payload="):
+            args["message"] = token.split("=", 1)[1]
+        elif "=" in token:
+            key, value = token.split("=", 1)
+            if key in {"to", "jid"}:
+                args["to"] = value
+            elif key in {"target", "name"}:
+                args["target"] = value
+            elif key in {"message", "text", "payload"}:
+                args["message"] = value
+            else:
+                positional.append(token)
+        else:
+            positional.append(token)
+        i += 1
+
+    if name == "whatsapp.bridge.resolve_contact" and "target" not in args and positional:
+        args["target"] = " ".join(positional)
+    if name == "whatsapp.bridge.send":
+        if "to" not in args and positional:
+            args["to"] = positional[0]
+        if "message" not in args and len(positional) > 1:
+            args["message"] = " ".join(positional[1:])
+    return {"name": name, "arguments": args}
+
+
+def _has_incomplete_registered_tool_call(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if "<tool_call" not in lowered and "<execute_tool" not in lowered:
+        return False
+    return not bool(_extract_registered_tool_calls(text))
 
 
 def _strip_tool_hallucinations(text: str) -> str:
@@ -2781,6 +2878,19 @@ class TalkToAliceWidget(SiftaBaseWidget):
         # <tool_call>{"name":"whatsapp.bridge.status","arguments":{}}</tool_call>
         # before the generic hallucinated-tool scrubber can remove it.
         structured_tool_calls = _extract_registered_tool_calls(raw)
+        if not structured_tool_calls and _has_incomplete_registered_tool_call(raw):
+            self._end_alice_streaming_line()
+            msg = (
+                "I tried to call a registered WhatsApp tool, but the JSON tool call was incomplete. "
+                "Please save the target from WhatsApp first with: Alice remember this chat as carlton."
+            )
+            self._append_alice_line(msg)
+            self._history.append({"role": "assistant", "content": msg})
+            _log_turn("alice", msg, model=model_name)
+            self._continuation_depth = 0
+            self._busy = False
+            self._return_to_listening()
+            return
         if structured_tool_calls:
             if getattr(self, "_tool_loop_depth", 0) >= 3:
                 self._append_system_line("tool depth limit reached.", error=False)
@@ -2859,6 +2969,31 @@ class TalkToAliceWidget(SiftaBaseWidget):
                 tool_results = []
                 for match in bash_matches:
                     cmd = match.group(1).strip()
+                    registered_shell_call = _registered_tool_call_from_shell_command(cmd)
+                    if registered_shell_call:
+                        name = str(registered_shell_call.get("name") or "")
+                        args = registered_shell_call.get("arguments") or {}
+                        self._append_system_line(
+                            f"Alice routing registered tool from shell syntax (depth {self._tool_loop_depth}/3): {name}",
+                            error=False,
+                        )
+                        try:
+                            from System.sifta_tool_registry import execute_tool_call
+                            result = execute_tool_call(name, args)
+                            tool_results.append(
+                                f"Output of registered tool `{name}`:\n"
+                                f"{json.dumps(result, indent=2)[:2000]}"
+                            )
+                        except Exception as exc:
+                            tool_results.append(f"Error running registered tool `{name}`: {exc}")
+                        continue
+                    first_word = cmd.split(maxsplit=1)[0] if cmd.split() else ""
+                    if first_word.startswith("whatsapp.bridge."):
+                        tool_results.append(
+                            "Blocked malformed WhatsApp registered tool command. "
+                            "Use <tool_call>{\"name\":\"whatsapp.bridge.send\",\"arguments\":{\"to\":\"carlton\",\"message\":\"success\"}}</tool_call>."
+                        )
+                        continue
                     self._append_system_line(f"🛠️  Alice executing (depth {self._tool_loop_depth}/3, max 90s): {cmd}", error=False)
                     try:
                         proc = subprocess.run(

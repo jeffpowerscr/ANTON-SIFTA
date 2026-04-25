@@ -17,6 +17,7 @@ import makeWASocket, {
 import qrcode from "qrcode-terminal";
 import http from "http";
 import fs from "fs";
+import crypto from "crypto";
 
 process.on("unhandledRejection", (err) => {
   console.error("[BRIDGE] Unhandled async error kept alive:", err?.message || err);
@@ -27,6 +28,7 @@ process.on("uncaughtException", (err) => {
 });
 
 const SIFTA_SERVER = "http://localhost:7434/swarm_message";
+const SESSION_DIR = process.env.SIFTA_WHATSAPP_SESSION_DIR || "./whatsapp_session";
 const MAX_WA_TEXT_TO_SIFTA = 8192;
 const MAX_INJECT_BODY = 16384;
 const INJECT_KEY = process.env.SIFTA_BRIDGE_INJECT_KEY || "";
@@ -49,7 +51,29 @@ const ALLOWED_ALIASES = new Set(
 );
 const ALIASES_FILE = "../../.sifta_state/whatsapp_alice_aliases.json";
 const CONTACTS_FILE = "../../.sifta_state/whatsapp_contacts.json";
+const DEBUG_FILE = "../../.sifta_state/whatsapp_bridge_debug.jsonl";
 let lastKnownHuman = null;
+
+function shortHash(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 12);
+}
+
+function logDebug(event, details = {}) {
+  const row = {
+    ts: Date.now() / 1000,
+    event,
+    ...details,
+  };
+  try {
+    fs.mkdirSync("../../.sifta_state", { recursive: true });
+    fs.appendFileSync(DEBUG_FILE, JSON.stringify(row) + "\n", { mode: 0o600 });
+  } catch {
+    // Debug logging must never break the bridge.
+  }
+  const printable = { ...row };
+  if (printable.text_preview) printable.text_preview = String(printable.text_preview).slice(0, 80);
+  console.log(`[WA DEBUG] ${JSON.stringify(printable)}`);
+}
 
 function loadJsonFile(file, fallback) {
   try {
@@ -169,7 +193,7 @@ function stripTrigger(text) {
 }
 
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState("./whatsapp_session");
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -190,6 +214,7 @@ async function connectToWhatsApp() {
     }
 
     if (connection === "open") {
+      logDebug("connection_open", { require_trigger: REQUIRE_TRIGGER, allow_groups: ALLOW_GROUPS });
       console.log("\n[🌊 SWARM BRIDGE] WhatsApp connected in reply-only mode.");
       console.log(`[🌊 SWARM BRIDGE] Say "${TRIGGER_WORD} ..." in a chat to ask Alice.`);
       if (!ALLOW_GROUPS) console.log("[🌊 SWARM BRIDGE] Group chats are muted by default.\n");
@@ -201,10 +226,12 @@ async function connectToWhatsApp() {
 
       if (!loggedOut) {
         // Code 515 = normal post-pairing restart. All other non-logout codes → reconnect.
+        logDebug("connection_close_reconnect", { statusCode });
         console.log(`[BRIDGE] Stream closed (code ${statusCode}). Reconnecting in 2s...`);
         setTimeout(connectToWhatsApp, 2000);
       } else {
-        console.log("[BRIDGE] Logged out from WhatsApp. Delete ./whatsapp_session/ and re-run to re-pair.");
+        logDebug("connection_logged_out", { statusCode });
+        console.log(`[BRIDGE] Logged out from WhatsApp. Clear ${SESSION_DIR} and re-run to re-pair.`);
         process.exit(1);
       }
     }
@@ -263,11 +290,32 @@ async function connectToWhatsApp() {
         msg.message?.imageMessage?.caption ||
         "";
 
-      if (!text) continue;
-      if (isGroup && !ALLOW_GROUPS) continue;
-      if (!isAllowedChat(from, participant)) continue;
+      logDebug("message_seen", {
+        type,
+        from_hash: shortHash(from),
+        participant_hash: participant ? shortHash(participant) : "",
+        fromMe,
+        isGroup,
+        hasText: Boolean(text),
+        text_preview: text,
+      });
+      if (!text) {
+        logDebug("message_skipped_no_text", { type, from_hash: shortHash(from), isGroup, fromMe });
+        continue;
+      }
+      if (isGroup && !ALLOW_GROUPS) {
+        logDebug("message_skipped_group_muted", { from_hash: shortHash(from), text_preview: text });
+        continue;
+      }
+      if (!isAllowedChat(from, participant)) {
+        logDebug("message_skipped_not_allowlisted", { from_hash: shortHash(from), participant_hash: participant ? shortHash(participant) : "" });
+        continue;
+      }
       const trigger = stripTrigger(text);
-      if (!trigger.ok) continue;
+      if (!trigger.ok) {
+        logDebug("message_skipped_missing_trigger", { from_hash: shortHash(from), text_preview: text });
+        continue;
+      }
       const safeText =
         trigger.text.length > MAX_WA_TEXT_TO_SIFTA
           ? trigger.text.slice(0, MAX_WA_TEXT_TO_SIFTA)
@@ -282,6 +330,7 @@ async function connectToWhatsApp() {
 
       console.log(`\n[📲 INCOMING] type=${type} fromMe=${fromMe} group=${isGroup} from=${from}`);
       console.log(`  Message to Alice: "${safeText}"`);
+      logDebug("message_forwarding_to_alice", { from_hash: shortHash(from), isGroup, fromMe, text_preview: safeText });
 
       const payload = JSON.stringify({
         from,
@@ -307,6 +356,7 @@ async function connectToWhatsApp() {
             const rawVoice = response.swarm_voice || response.reply;
             if (rawVoice === "_SILENT_") {
               console.log("  [SWARM IS SILENT]");
+              logDebug("alice_returned_silent", { from_hash: shortHash(from) });
               return;
             }
             const reply = rawVoice || "🌊";
@@ -321,13 +371,16 @@ async function connectToWhatsApp() {
             const sent = await sock.sendMessage(from, { text: reply });
             if (sent?.key?.id) sentBySwarm.add(sent.key.id);
             console.log(`  [SWARM REPLIED] "${reply.substring(0, 80)}..."`);
+            logDebug("reply_sent", { from_hash: shortHash(from), reply_preview: reply });
           } catch (e) {
             console.error("[BRIDGE] Failed to parse SIFTA response:", e);
+            logDebug("reply_parse_failed", { from_hash: shortHash(from), error: e?.message || String(e) });
           }
         });
       });
 
       req.on("error", () => {
+        logDebug("alice_server_request_error", { from_hash: shortHash(from) });
         if (SEND_REPLIES) {
           sock.sendMessage(from, {
             text: "Alice's local bridge is offline. Restart scripts/start_swarm_whatsapp.sh.",
@@ -396,5 +449,6 @@ async function connectToWhatsApp() {
 }
 
 console.log("[🌊 SIFTA BRIDGE] Booting WhatsApp connection...");
+console.log(`[🌊 SIFTA BRIDGE] Session dir: ${SESSION_DIR}`);
 validateSafetyConfig();
 connectToWhatsApp();

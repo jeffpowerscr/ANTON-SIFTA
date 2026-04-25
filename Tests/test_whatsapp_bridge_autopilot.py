@@ -37,16 +37,16 @@ def test_autopilot_resolves_saved_alias(tmp_path, monkeypatch):
 
     alias_path = tmp_path / "aliases.json"
     alias_path.write_text(
-        '{"carltonn": {"jid": "target@s.whatsapp.net", "jid_hash": "x"}}',
+        '{"carlton": {"jid": "target@s.whatsapp.net", "jid_hash": "x"}}',
         encoding="utf-8",
     )
     monkeypatch.setattr(autopilot, "ALIAS_PATH", alias_path)
 
-    result = autopilot.resolve_target("Carltonn")
+    result = autopilot.resolve_target("Carlton")
 
     assert result["ok"] is True
     assert result["jid"] == "target@s.whatsapp.net"
-    assert result["alias"] == "carltonn"
+    assert result["alias"] == "carlton"
 
 
 def test_autopilot_resolves_unique_contact_name_and_caches_alias(tmp_path, monkeypatch):
@@ -61,7 +61,7 @@ def test_autopilot_resolves_unique_contact_name_and_caches_alias(tmp_path, monke
           "contacts": {
             "target@s.whatsapp.net": {
               "jid": "target@s.whatsapp.net",
-              "display_names": ["Carltonn"]
+              "display_names": ["Carlton"]
             }
           }
         }
@@ -71,12 +71,12 @@ def test_autopilot_resolves_unique_contact_name_and_caches_alias(tmp_path, monke
     monkeypatch.setattr(autopilot, "CONTACTS_PATH", contacts_path)
     monkeypatch.setattr(autopilot, "ALIAS_PATH", aliases_path)
 
-    result = autopilot.resolve_target("Carltonn")
+    result = autopilot.resolve_target("Carlton")
 
     assert result["ok"] is True
     assert result["jid"] == "target@s.whatsapp.net"
-    assert result["alias"] == "carltonn"
-    assert "carltonn" in aliases_path.read_text(encoding="utf-8")
+    assert result["alias"] == "carlton"
+    assert "carlton" in aliases_path.read_text(encoding="utf-8")
 
 
 def test_autopilot_reports_ambiguous_contact_name(tmp_path, monkeypatch):
@@ -87,8 +87,8 @@ def test_autopilot_reports_ambiguous_contact_name(tmp_path, monkeypatch):
         """
         {
           "contacts": {
-            "one@s.whatsapp.net": {"jid": "one@s.whatsapp.net", "display_names": ["Carltonn"]},
-            "two@s.whatsapp.net": {"jid": "two@s.whatsapp.net", "display_names": ["Carltonn"]}
+            "one@s.whatsapp.net": {"jid": "one@s.whatsapp.net", "display_names": ["Carlton"]},
+            "two@s.whatsapp.net": {"jid": "two@s.whatsapp.net", "display_names": ["Carlton"]}
           }
         }
         """,
@@ -97,7 +97,7 @@ def test_autopilot_reports_ambiguous_contact_name(tmp_path, monkeypatch):
     monkeypatch.setattr(autopilot, "CONTACTS_PATH", contacts_path)
     monkeypatch.setattr(autopilot, "ALIAS_PATH", tmp_path / "aliases.json")
 
-    result = autopilot.resolve_target("Carltonn")
+    result = autopilot.resolve_target("Carlton")
 
     assert result["ok"] is False
     assert result["error"] == "ambiguous_contact_name"
@@ -109,6 +109,7 @@ def test_autopilot_send_blocks_without_inject_key(monkeypatch):
 
     monkeypatch.setenv("SIFTA_WHATSAPP_ALLOWED_JIDS", "allowed@s.whatsapp.net")
     monkeypatch.delenv("SIFTA_BRIDGE_INJECT_KEY", raising=False)
+    monkeypatch.setattr(autopilot, "RUNTIME_PATH", autopilot.STATE_DIR / "missing-test-runtime.json")
 
     result = autopilot.send_message(to="allowed@s.whatsapp.net", message="hello")
 
@@ -124,4 +125,4 @@ def test_prompt_contract_names_autopilot_send_tool():
     assert "System.whatsapp_bridge_autopilot status" in hint
     assert "whatsapp.bridge.resolve_contact" in hint
     assert "whatsapp.bridge.send" in hint
-    assert "display name like Carltonn" in hint
+    assert "display name like Carlton" in hint

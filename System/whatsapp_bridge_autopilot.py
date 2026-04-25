@@ -13,6 +13,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -34,6 +35,17 @@ def _port_open(host: str = "127.0.0.1", port: int = INJECT_PORT, timeout: float 
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
+        pass
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        return proc.returncode == 0 and f":{port} " in proc.stdout
+    except Exception:
         return False
 
 

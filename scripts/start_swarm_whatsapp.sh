@@ -34,6 +34,7 @@ export SIFTA_WHATSAPP_ALLOW_GROUPS="${SIFTA_WHATSAPP_ALLOW_GROUPS:-0}"
 export SIFTA_WHATSAPP_ENABLE_INJECT="${SIFTA_WHATSAPP_ENABLE_INJECT:-0}"
 export SIFTA_WHATSAPP_ALLOWED_ALIASES="${SIFTA_WHATSAPP_ALLOWED_ALIASES:-}"
 export SIFTA_WHATSAPP_ALLOWED_JIDS="${SIFTA_WHATSAPP_ALLOWED_JIDS:-}"
+export SIFTA_WHATSAPP_SESSION_DIR="${SIFTA_WHATSAPP_SESSION_DIR:-$REPO_ROOT/.sifta_state/whatsapp_session}"
 
 if [ "$SIFTA_WHATSAPP_ENABLE_INJECT" = "1" ] && [ -z "${SIFTA_BRIDGE_INJECT_KEY:-}" ]; then
   export SIFTA_BRIDGE_INJECT_KEY="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_hex(32))')"
@@ -52,6 +53,7 @@ echo " Trigger: ${SIFTA_WHATSAPP_TRIGGER}"
 echo " Group chats: ${SIFTA_WHATSAPP_ALLOW_GROUPS}"
 echo " Injection: ${SIFTA_WHATSAPP_ENABLE_INJECT}"
 echo " Allowed aliases: ${SIFTA_WHATSAPP_ALLOWED_ALIASES:-none}"
+echo " Session dir: ${SIFTA_WHATSAPP_SESSION_DIR}"
 echo "============================================================"
 echo ""
 

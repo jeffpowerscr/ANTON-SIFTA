@@ -21,7 +21,7 @@ def test_registered_tool_execution_validates_arguments():
     from System.sifta_tool_registry import execute_tool_call
 
     unknown = execute_tool_call("nope", {})
-    missing = execute_tool_call("whatsapp.bridge.send", {"to": "carltonn"})
+    missing = execute_tool_call("whatsapp.bridge.send", {"to": "carlton"})
 
     assert unknown["ok"] is False
     assert unknown["error"] == "unknown_tool"
@@ -41,18 +41,32 @@ def test_registered_contact_resolution_tool_validates_target():
 
 
 def test_alice_widget_extracts_registered_tool_calls():
-    from Applications.sifta_talk_to_alice_widget import _extract_registered_tool_calls
+    from Applications.sifta_talk_to_alice_widget import (
+        _extract_registered_tool_calls,
+        _has_incomplete_registered_tool_call,
+        _registered_tool_call_from_shell_command,
+    )
 
     calls = _extract_registered_tool_calls(
-        '<tool_call>{"name":"whatsapp.bridge.send","arguments":{"to":"carltonn","message":"hello"}}</tool_call>'
+        '<tool_call>{"name":"whatsapp.bridge.send","arguments":{"to":"carlton","message":"hello"}}</tool_call>'
     )
 
     assert calls == [
         {
             "name": "whatsapp.bridge.send",
-            "arguments": {"to": "carltonn", "message": "hello"},
+            "arguments": {"to": "carlton", "message": "hello"},
         }
     ]
+    assert _has_incomplete_registered_tool_call('<tool_call>{"name":"whatsapp.bridge.send","arguments":{"to":') is True
+    assert _has_incomplete_registered_tool_call('<tool_call>{"name":"whatsapp.bridge.status","arguments":{}}</tool_call>') is False
+    assert _registered_tool_call_from_shell_command("whatsapp.bridge.send --to carlton --message success") == {
+        "name": "whatsapp.bridge.send",
+        "arguments": {"to": "carlton", "message": "success"},
+    }
+    assert _registered_tool_call_from_shell_command("whatsapp.bridge.resolve_contact Carlton") == {
+        "name": "whatsapp.bridge.resolve_contact",
+        "arguments": {"target": "Carlton"},
+    }
 
 
 def test_whatsapp_prompt_includes_registered_schema():
