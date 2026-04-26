@@ -53,6 +53,8 @@ const ALIASES_FILE = "../../.sifta_state/whatsapp_alice_aliases.json";
 const CONTACTS_FILE = "../../.sifta_state/whatsapp_contacts.json";
 const DEBUG_FILE = "../../.sifta_state/whatsapp_bridge_debug.jsonl";
 let lastKnownHuman = null;
+let activeSock = null;
+let injectServer = null;
 
 function shortHash(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 12);
@@ -214,6 +216,7 @@ async function connectToWhatsApp() {
     }
 
     if (connection === "open") {
+      activeSock = sock;
       logDebug("connection_open", { require_trigger: REQUIRE_TRIGGER, allow_groups: ALLOW_GROUPS });
       console.log("\n[🌊 SWARM BRIDGE] WhatsApp connected in reply-only mode.");
       console.log(`[🌊 SWARM BRIDGE] Say "${TRIGGER_WORD} ..." in a chat to ask Alice.`);
@@ -223,6 +226,7 @@ async function connectToWhatsApp() {
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+      if (activeSock === sock) activeSock = null;
 
       if (!loggedOut) {
         // Code 515 = normal post-pairing restart. All other non-logout codes → reconnect.
@@ -402,7 +406,11 @@ async function connectToWhatsApp() {
     console.log("[🌊 SWARM BRIDGE] Injection requested, but SIFTA_BRIDGE_INJECT_KEY is missing. Staying reply-only.");
     return;
   }
-  const injectServer = http.createServer((req, res) => {
+  if (injectServer) {
+    console.log("[🌊 SWARM BRIDGE] Explicit Injection Server already listening on 127.0.0.1:3001");
+    return;
+  }
+  injectServer = http.createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/system_inject') {
         if (req.headers["x-sifta-inject-key"] !== INJECT_KEY) {
           res.writeHead(401, { "Content-Type": "application/json" });
@@ -417,24 +425,36 @@ async function connectToWhatsApp() {
             try {
                 const data = JSON.parse(body);
                 const target = (typeof data.to === "string" && data.to.trim()) ? data.to.trim() : lastKnownHuman;
+                const outboundSock = activeSock;
+                if (!outboundSock) {
+                    logDebug("inject_failed_no_active_socket", { target_hash: shortHash(target) });
+                    res.writeHead(503, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({ok: false, error: "whatsapp_socket_not_connected"}));
+                    return;
+                }
                 if (target && typeof data.text === "string" && data.text.trim() && isAllowedChat(target)) {
-                    await sock.sendPresenceUpdate("composing", target);
+                    await outboundSock.sendPresenceUpdate("composing", target);
                     await new Promise(r => setTimeout(r, 1200));
-                    await sock.sendPresenceUpdate("paused", target);
-                    const sent = await sock.sendMessage(target, { text: data.text });
+                    await outboundSock.sendPresenceUpdate("paused", target);
+                    const sent = await outboundSock.sendMessage(target, { text: data.text });
                     if (sent?.key?.id) {
                         sentBySwarm.add(sent.key.id);
                     }
                     console.log(`\n[INJECT] Pushed explicit message to WhatsApp target=${target}: ${data.text.substring(0,60)}...`);
+                    logDebug("inject_sent", { target_hash: shortHash(target), text_preview: data.text });
+                    res.writeHead(200, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({ok: true}));
                 } else {
                     console.log(`\n[INJECT] Failed. Missing target/text or target is not allowlisted.`);
+                    logDebug("inject_blocked", { target_hash: shortHash(target) });
+                    res.writeHead(403, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({ok: false, error: "target_not_allowlisted_or_missing_text"}));
                 }
-                res.writeHead(200, {"Content-Type": "application/json"});
-                res.end(JSON.stringify({ok: true}));
             } catch(e) {
                 console.error(`[INJECT ERROR] ${e}`);
-                res.writeHead(500);
-                res.end('Error');
+                logDebug("inject_error", { error: e?.message || String(e) });
+                res.writeHead(500, {"Content-Type": "application/json"});
+                res.end(JSON.stringify({ok: false, error: e?.message || String(e)}));
             }
         });
     } else {
